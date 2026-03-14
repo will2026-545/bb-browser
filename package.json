@@ -1,6 +1,6 @@
 {
   "name": "bb-browser",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "AI Agent browser automation CLI - control Chrome with user's login state",
   "type": "module",
   "bin": {

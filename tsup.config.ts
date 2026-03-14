@@ -17,6 +17,6 @@ export default defineConfig({
     js: "#!/usr/bin/env node",
   },
   // 全部 bundle 进去（npx 可用），只保留 ws（CommonJS 动态 require）
-  noExternal: [/.*/],
+  noExternal: [/^(?!ws$).*/],
   external: ["ws"],
 });

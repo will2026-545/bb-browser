@@ -113,6 +113,7 @@ bb-browser - AI Agent 浏览器自动化工具
   -d, --depth <n> 限制树深度（snapshot 命令）
   -s, --selector <sel> 限定 CSS 选择器范围（snapshot 命令）
   --tab <tabId>   指定操作的标签页 ID
+  --mcp           启动 MCP server（用于 Claude Code / Cursor 等 AI 工具）
   --help, -h      显示帮助信息
   --version, -v   显示版本号
 
@@ -224,6 +225,14 @@ async function main(): Promise<void> {
   // 处理全局选项
   if (parsed.flags.version) {
     console.log(VERSION);
+    return;
+  }
+
+  if (process.argv.includes("--mcp")) {
+    const mcpPath = new URL("./mcp.js", import.meta.url).pathname;
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [mcpPath], { stdio: "inherit" });
+    child.on("exit", (code) => process.exit(code ?? 0));
     return;
   }
 

@@ -290,12 +290,13 @@ server.tool(
   }
 );
 
-async function main() {
+export async function startMcpServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch((error) => {
+// 直接运行时自启动
+startMcpServer().catch((error) => {
   console.error(error);
   process.exit(1);
 });
