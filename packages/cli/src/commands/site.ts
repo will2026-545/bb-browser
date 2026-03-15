@@ -31,6 +31,7 @@ export interface SiteOptions {
   tabId?: number;
   days?: number;
   jq?: string;
+  openclaw?: boolean;
 }
 
 /** Adapter 参数定义 */
@@ -518,6 +519,67 @@ async function siteRun(
   // 构造执行脚本
   const argsJson = JSON.stringify(argMap);
   const script = `(${jsBody})(${argsJson})`;
+
+  if (options.openclaw) {
+    const { ocGetTabs, ocFindTabByDomain, ocOpenTab, ocEvaluate } = await import("../openclaw-bridge.js");
+
+    let targetId: string;
+
+    if (site.domain) {
+      const tabs = ocGetTabs();
+      const existing = ocFindTabByDomain(tabs, site.domain);
+      if (existing) {
+        targetId = existing.targetId;
+      } else {
+        targetId = ocOpenTab(`https://${site.domain}`);
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    } else {
+      const tabs = ocGetTabs();
+      if (tabs.length === 0) {
+        throw new Error("No tabs open in OpenClaw browser");
+      }
+      targetId = tabs[0].targetId;
+    }
+
+    const wrappedFn = `async () => { const __fn = ${jsBody}; return await __fn(${argsJson}); }`;
+    const parsed = ocEvaluate(targetId, wrappedFn);
+
+    if (typeof parsed === "object" && parsed !== null && "error" in parsed) {
+      const errObj = parsed as { error: string; hint?: string };
+      const checkText = `${errObj.error} ${errObj.hint || ""}`;
+      const isAuthError = /401|403|unauthorized|forbidden|not.?logged|login.?required|sign.?in|auth/i.test(checkText);
+      const loginHint = isAuthError && site.domain
+        ? `Please log in to https://${site.domain} in your OpenClaw browser first, then retry.`
+        : undefined;
+      const hint = loginHint || errObj.hint;
+      const reportHint = `If this is an adapter bug, report via: gh issue create --repo epiral/bb-sites --title "[${name}] <description>" OR: bb-browser site github/issue-create epiral/bb-sites --title "[${name}] <description>"`;
+
+      if (options.json) {
+        console.log(JSON.stringify({ id: "openclaw", success: false, error: errObj.error, hint, reportHint }));
+      } else {
+        console.error(`[error] site ${name}: ${errObj.error}`);
+        if (hint) console.error(`  Hint: ${hint}`);
+        console.error(`  Report: gh issue create --repo epiral/bb-sites --title "[${name}] ..."`);
+        console.error(`     or: bb-browser site github/issue-create epiral/bb-sites --title "[${name}] ..."`);
+      }
+      process.exit(1);
+    }
+
+    if (options.jq) {
+      const { applyJq } = await import("../jq.js");
+      const expr = options.jq.replace(/^\.data\./, '.');
+      const results = applyJq(parsed, expr);
+      for (const r of results) {
+        console.log(typeof r === "string" ? r : JSON.stringify(r));
+      }
+    } else if (options.json) {
+      console.log(JSON.stringify({ id: "openclaw", success: true, data: parsed }));
+    } else {
+      console.log(JSON.stringify(parsed, null, 2));
+    }
+    return;
+  }
 
   await ensureDaemonRunning();
 

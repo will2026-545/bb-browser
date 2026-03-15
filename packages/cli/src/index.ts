@@ -124,6 +124,7 @@ interface ParsedArgs {
     tab?: string;
     days?: number;
     jq?: string;
+    openclaw?: boolean;
   };
 }
 
@@ -160,6 +161,8 @@ function parseArgs(argv: string[]): ParsedArgs {
         result.flags.jq = args[nextIdx];
         result.flags.json = true;
       }
+    } else if (arg === "--openclaw") {
+      result.flags.openclaw = true;
     } else if (arg === "--help" || arg === "-h") {
       result.flags.help = true;
     } else if (arg === "--version" || arg === "-v") {
@@ -617,6 +620,7 @@ async function main(): Promise<void> {
           jq: parsed.flags.jq,
           days: parsed.flags.days,
           tabId: globalTabId,
+          openclaw: parsed.flags.openclaw,
         });
         break;
       }
