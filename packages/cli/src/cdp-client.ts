@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
@@ -448,13 +449,109 @@ async function ensurePageTarget(targetId?: string | number): Promise<CdpTargetIn
   return target;
 }
 
-function parseRef(ref: string): number {
-  const refs = connectionState?.refsByTarget.get(connectionState.currentTargetId ?? "") ?? {};
+async function resolveBackendNodeIdByXPath(targetId: string, xpath: string): Promise<number> {
+  // Populate the DOM agent's node map — required before performSearch/describeNode
+  await sessionCommand(targetId, "DOM.getDocument", { depth: 0 });
+
+  const search = await sessionCommand<{ searchId: string; resultCount: number }>(targetId, "DOM.performSearch", {
+    query: xpath,
+    includeUserAgentShadowDOM: true,
+  });
+
+  try {
+    if (!search.resultCount) {
+      throw new Error(`Unknown ref xpath: ${xpath}`);
+    }
+
+    const { nodeIds } = await sessionCommand<{ nodeIds: number[] }>(targetId, "DOM.getSearchResults", {
+      searchId: search.searchId,
+      fromIndex: 0,
+      toIndex: search.resultCount,
+    });
+
+    for (const nodeId of nodeIds) {
+      const described = await sessionCommand<{ node: { backendNodeId?: number; nodeName?: string } }>(targetId, "DOM.describeNode", {
+        nodeId,
+      });
+      if (described.node.backendNodeId) {
+        return described.node.backendNodeId;
+      }
+    }
+
+    throw new Error(`XPath resolved but no backend node id found: ${xpath}`);
+  } finally {
+    await sessionCommand(targetId, "DOM.discardSearchResults", { searchId: search.searchId }).catch(() => {});
+  }
+}
+
+async function parseRef(ref: string): Promise<number> {
+  const targetId = connectionState?.currentTargetId ?? "";
+  let refs = connectionState?.refsByTarget.get(targetId) ?? {};
+  if (!refs[ref] && targetId) {
+    const persistedRefs = loadPersistedRefs(targetId);
+    if (persistedRefs) {
+      connectionState?.refsByTarget.set(targetId, persistedRefs);
+      refs = persistedRefs;
+    }
+  }
   const found = refs[ref];
-  if (!found?.backendDOMNodeId) {
+  if (!found) {
     throw new Error(`Unknown ref: ${ref}. Run snapshot first.`);
   }
-  return found.backendDOMNodeId;
+  if (found.backendDOMNodeId) {
+    return found.backendDOMNodeId;
+  }
+  if (targetId && found.xpath) {
+    const backendDOMNodeId = await resolveBackendNodeIdByXPath(targetId, found.xpath);
+    found.backendDOMNodeId = backendDOMNodeId;
+    connectionState?.refsByTarget.set(targetId, refs);
+    const pageUrl = await evaluate<string>(targetId, "location.href", true).catch(() => undefined);
+    if (pageUrl) {
+      persistRefs(targetId, pageUrl, refs);
+    }
+    return backendDOMNodeId;
+  }
+  throw new Error(`Unknown ref: ${ref}. Run snapshot first.`);
+}
+
+function getRefsFilePath(targetId: string): string {
+  return path.join(os.tmpdir(), `bb-browser-refs-${targetId}.json`);
+}
+
+function getCurrentTargetUrl(targetId: string): string | null {
+  const state = connectionState;
+  if (!state) return null;
+  const pages = Array.from(state.sessions.keys());
+  void pages;
+  return null;
+}
+
+function loadPersistedRefs(targetId: string, expectedUrl?: string): Record<string, RefInfo> | null {
+  try {
+    const data = JSON.parse(readFileSync(getRefsFilePath(targetId), "utf-8")) as {
+      targetId?: unknown;
+      url?: unknown;
+      refs?: unknown;
+    };
+    if (data.targetId !== targetId) return null;
+    if (expectedUrl !== undefined && data.url !== expectedUrl) return null;
+    if (!data.refs || typeof data.refs !== "object") return null;
+    return data.refs as Record<string, RefInfo>;
+  } catch {
+    return null;
+  }
+}
+
+function persistRefs(targetId: string, url: string, refs: Record<string, RefInfo>): void {
+  try {
+    writeFileSync(getRefsFilePath(targetId), JSON.stringify({ targetId, url, timestamp: Date.now(), refs }));
+  } catch {}
+}
+
+function clearPersistedRefs(targetId: string): void {
+  try {
+    unlinkSync(getRefsFilePath(targetId));
+  } catch {}
 }
 
 function loadBuildDomTreeScript(): string {
@@ -503,8 +600,37 @@ async function resolveNode(targetId: string, backendNodeId: number): Promise<num
 }
 
 async function focusNode(targetId: string, backendNodeId: number): Promise<void> {
-  const nodeId = await resolveNode(targetId, backendNodeId);
-  await sessionCommand(targetId, "DOM.focus", { nodeId });
+  await sessionCommand(targetId, "DOM.focus", { backendNodeId });
+}
+
+async function insertTextIntoNode(targetId: string, backendNodeId: number, text: string, clearFirst: boolean): Promise<void> {
+  const resolved = await sessionCommand<{ object: { objectId: string } }>(targetId, "DOM.resolveNode", { backendNodeId });
+
+  await sessionCommand(targetId, "Runtime.callFunctionOn", {
+    objectId: resolved.object.objectId,
+    functionDeclaration: `function(value, clearFirst) {
+      if (typeof this.focus === 'function') this.focus();
+      if (clearFirst && ('value' in this)) {
+        this.value = '';
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      if ('value' in this) {
+        this.value = clearFirst ? value : String(this.value ?? '') + value;
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+        this.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }
+      return false;
+    }`,
+    arguments: [
+      { value: text },
+      { value: clearFirst },
+    ],
+    returnByValue: true,
+  });
+
+  await focusNode(targetId, backendNodeId);
+  await sessionCommand(targetId, "Input.insertText", { text });
 }
 
 async function getNodeBox(targetId: string, backendNodeId: number): Promise<{ x: number; y: number }> {
@@ -555,7 +681,17 @@ async function buildSnapshot(targetId: string, request: Request): Promise<Snapsh
   })}); })()`;
   const value = await evaluate<BuildDomTreeResult | null>(targetId, expression, true);
   if (!value || !value.map || !value.rootId) {
-    throw new Error("Failed to build DOM tree: invalid result structure");
+    const title = await evaluate<string>(targetId, "document.title", true);
+    const pageUrl = await evaluate<string>(targetId, "location.href", true);
+    const fallbackSnapshot: SnapshotData = {
+      title,
+      url: pageUrl,
+      lines: [title || pageUrl],
+      refs: {},
+    };
+    connectionState?.refsByTarget.set(targetId, {});
+    persistRefs(targetId, pageUrl, {});
+    return fallbackSnapshot;
   }
 
   const snapshot = convertBuildDomTreeResult(value, {
@@ -564,7 +700,9 @@ async function buildSnapshot(targetId: string, request: Request): Promise<Snapsh
     maxDepth: request.maxDepth,
     selector: request.selector,
   });
+  const pageUrl = await evaluate<string>(targetId, "location.href", true);
   connectionState?.refsByTarget.set(targetId, snapshot.refs || {});
+  persistRefs(targetId, pageUrl, snapshot.refs || {});
   return snapshot;
 }
 
@@ -747,6 +885,8 @@ async function dispatchRequest(request: Request): Promise<Response> {
         return ok(request.id, { url: request.url, tabId: newTarget.id });
       }
       await pageCommand(target.id, "Page.navigate", { url: request.url });
+      connectionState?.refsByTarget.delete(target.id);
+      clearPersistedRefs(target.id);
       return ok(request.id, { url: request.url, title: target.title, tabId: target.id });
     }
     case "snapshot": {
@@ -756,7 +896,7 @@ async function dispatchRequest(request: Request): Promise<Response> {
     case "click":
     case "hover": {
       if (!request.ref) return fail(request.id, "Missing ref parameter");
-      const backendNodeId = parseRef(request.ref);
+      const backendNodeId = await parseRef(request.ref);
       const point = await getNodeBox(target.id, backendNodeId);
       await sessionCommand(target.id, "Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "none" });
       if (request.action === "click") await mouseClick(target.id, point.x, point.y);
@@ -766,18 +906,14 @@ async function dispatchRequest(request: Request): Promise<Response> {
     case "type": {
       if (!request.ref) return fail(request.id, "Missing ref parameter");
       if (request.text == null) return fail(request.id, "Missing text parameter");
-      const backendNodeId = parseRef(request.ref);
-      await focusNode(target.id, backendNodeId);
-      if (request.action === "fill") {
-        await evaluate(target.id, `document.activeElement && ((document.activeElement.value = ''), document.activeElement.dispatchEvent(new Event('input', { bubbles: true })))`);
-      }
-      await sessionCommand(target.id, "Input.insertText", { text: request.text });
+      const backendNodeId = await parseRef(request.ref);
+      await insertTextIntoNode(target.id, backendNodeId, request.text, request.action === "fill");
       return ok(request.id, { value: request.text });
     }
     case "check":
     case "uncheck": {
       if (!request.ref) return fail(request.id, "Missing ref parameter");
-      const backendNodeId = parseRef(request.ref);
+      const backendNodeId = await parseRef(request.ref);
       const desired = request.action === "check";
       const resolved = await sessionCommand<{ object: { objectId: string } }>(target.id, "DOM.resolveNode", { backendNodeId });
       await sessionCommand(target.id, "Runtime.callFunctionOn", {
@@ -788,7 +924,7 @@ async function dispatchRequest(request: Request): Promise<Response> {
     }
     case "select": {
       if (!request.ref || request.value == null) return fail(request.id, "Missing ref or value parameter");
-      const backendNodeId = parseRef(request.ref);
+      const backendNodeId = await parseRef(request.ref);
       const resolved = await sessionCommand<{ object: { objectId: string } }>(target.id, "DOM.resolveNode", { backendNodeId });
       await sessionCommand(target.id, "Runtime.callFunctionOn", {
         objectId: resolved.object.objectId,
@@ -798,7 +934,7 @@ async function dispatchRequest(request: Request): Promise<Response> {
     }
     case "get": {
       if (!request.ref || !request.attribute) return fail(request.id, "Missing ref or attribute parameter");
-      const value = await getAttributeValue(target.id, parseRef(request.ref), request.attribute);
+      const value = await getAttributeValue(target.id, await parseRef(request.ref), request.attribute);
       return ok(request.id, { value });
     }
     case "screenshot": {
@@ -807,6 +943,8 @@ async function dispatchRequest(request: Request): Promise<Response> {
     }
     case "close": {
       await browserCommand("Target.closeTarget", { targetId: target.id });
+      connectionState?.refsByTarget.delete(target.id);
+      clearPersistedRefs(target.id);
       return ok(request.id, {});
     }
     case "wait": {
@@ -869,6 +1007,8 @@ async function dispatchRequest(request: Request): Promise<Response> {
         : tabs[request.index ?? 0];
       if (!selected) return fail(request.id, "Tab not found");
       await browserCommand("Target.closeTarget", { targetId: selected.id });
+      connectionState?.refsByTarget.delete(selected.id);
+      clearPersistedRefs(selected.id);
       return ok(request.id, { tabId: selected.id });
     }
     case "frame": {
