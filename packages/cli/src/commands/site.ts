@@ -80,6 +80,11 @@ interface SiteRecommendation {
   }>;
 }
 
+function exitJsonError(error: string, extra: Record<string, unknown> = {}): never {
+  console.log(JSON.stringify({ success: false, error, ...extra }, null, 2));
+  process.exit(1);
+}
+
 /**
  * 从 JS 文件的 /* @meta JSON * / 块解析元数据
  */
@@ -220,18 +225,18 @@ function matchTabOrigin(tabUrl: string, domain: string): boolean {
 function siteList(options: SiteOptions): void {
   const sites = getAllSites();
 
-  if (sites.length === 0) {
-    console.log("未找到任何 site adapter。");
-    console.log("  安装社区 adapter: bb-browser site update");
-    console.log(`  私有 adapter 目录: ${LOCAL_SITES_DIR}`);
-    return;
-  }
-
   if (options.json) {
     console.log(JSON.stringify(sites.map(s => ({
       name: s.name, description: s.description, domain: s.domain,
       args: s.args, source: s.source,
     })), null, 2));
+    return;
+  }
+
+  if (sites.length === 0) {
+    console.log("未找到任何 site adapter。");
+    console.log("  安装社区 adapter: bb-browser site update");
+    console.log(`  私有 adapter 目录: ${LOCAL_SITES_DIR}`);
     return;
   }
 
@@ -263,16 +268,16 @@ function siteSearch(query: string, options: SiteOptions): void {
     s.domain.toLowerCase().includes(q)
   );
 
-  if (matches.length === 0) {
-    console.log(`未找到匹配 "${query}" 的 adapter。`);
-    console.log("  查看所有: bb-browser site list");
-    return;
-  }
-
   if (options.json) {
     console.log(JSON.stringify(matches.map(s => ({
       name: s.name, description: s.description, domain: s.domain, source: s.source,
     })), null, 2));
+    return;
+  }
+
+  if (matches.length === 0) {
+    console.log(`未找到匹配 "${query}" 的 adapter。`);
+    console.log("  查看所有: bb-browser site list");
     return;
   }
 
@@ -282,29 +287,48 @@ function siteSearch(query: string, options: SiteOptions): void {
   }
 }
 
-function siteUpdate(): void {
+function siteUpdate(options: SiteOptions = {}): void {
   mkdirSync(BB_DIR, { recursive: true });
+  const updateMode = existsSync(join(COMMUNITY_SITES_DIR, ".git")) ? "pull" : "clone";
 
-  if (existsSync(join(COMMUNITY_SITES_DIR, ".git"))) {
-    console.log("更新社区 site adapter 库...");
+  if (updateMode === "pull") {
+    if (!options.json) {
+      console.log("更新社区 site adapter 库...");
+    }
     try {
       execSync("git pull --ff-only", { cwd: COMMUNITY_SITES_DIR, stdio: "pipe" });
-      console.log("更新完成。");
-      console.log("");
-      console.log("💡 运行 bb-browser site recommend 看看哪些和你的浏览习惯匹配");
+      if (!options.json) {
+        console.log("更新完成。");
+        console.log("");
+        console.log("💡 运行 bb-browser site recommend 看看哪些和你的浏览习惯匹配");
+      }
     } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      const manualAction = "cd ~/.bb-browser/bb-sites && git pull";
+      if (options.json) {
+        exitJsonError(`更新失败: ${message}`, { action: manualAction, updateMode });
+      }
       console.error(`更新失败: ${e instanceof Error ? e.message : e}`);
       console.error("  手动修复: cd ~/.bb-browser/bb-sites && git pull");
       process.exit(1);
     }
   } else {
-    console.log(`克隆社区 adapter 库: ${COMMUNITY_REPO}`);
+    if (!options.json) {
+      console.log(`克隆社区 adapter 库: ${COMMUNITY_REPO}`);
+    }
     try {
       execSync(`git clone ${COMMUNITY_REPO} ${COMMUNITY_SITES_DIR}`, { stdio: "pipe" });
-      console.log("克隆完成。");
-      console.log("");
-      console.log("💡 运行 bb-browser site recommend 看看哪些和你的浏览习惯匹配");
+      if (!options.json) {
+        console.log("克隆完成。");
+        console.log("");
+        console.log("💡 运行 bb-browser site recommend 看看哪些和你的浏览习惯匹配");
+      }
     } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      const manualAction = `git clone ${COMMUNITY_REPO} ~/.bb-browser/bb-sites`;
+      if (options.json) {
+        exitJsonError(`克隆失败: ${message}`, { action: manualAction, updateMode });
+      }
       console.error(`克隆失败: ${e instanceof Error ? e.message : e}`);
       console.error(`  手动修复: git clone ${COMMUNITY_REPO} ~/.bb-browser/bb-sites`);
       process.exit(1);
@@ -312,6 +336,17 @@ function siteUpdate(): void {
   }
 
   const sites = scanSites(COMMUNITY_SITES_DIR, "community");
+  if (options.json) {
+    console.log(JSON.stringify({
+      success: true,
+      updateMode,
+      communityRepo: COMMUNITY_REPO,
+      communityDir: COMMUNITY_SITES_DIR,
+      siteCount: sites.length,
+    }, null, 2));
+    return;
+  }
+
   console.log(`已安装 ${sites.length} 个社区 adapter。`);
   console.log(`⭐ Like bb-browser? → bb-browser star`);
 
@@ -327,6 +362,9 @@ function siteInfo(name: string, options: SiteOptions): void {
   const site = findSiteByName(name);
 
   if (!site) {
+    if (options.json) {
+      exitJsonError(`adapter "${name}" not found`, { action: "bb-browser site list" });
+    }
     console.error(`[error] site info: adapter "${name}" not found.`);
     console.error("  Try: bb-browser site list");
     process.exit(1);
@@ -400,7 +438,7 @@ async function siteRecommend(options: SiteOptions): Promise<void> {
           example: site.example || `bb-browser site ${site.name}`,
         })),
       });
-    } else if (item.visits >= 5 && item.domain && !item.domain.includes('localhost') && item.domain.includes('.')) {
+    } else if (item.visits >= 5 && item.domain && !item.domain.includes("localhost") && item.domain.includes(".")) {
       notAvailable.push(item);
     }
   }
@@ -448,19 +486,25 @@ async function siteRecommend(options: SiteOptions): Promise<void> {
   console.log();
   console.log('💡 跟你的 AI Agent 说 "把 notion.so CLI 化"，它就能自动完成。');
   console.log();
-  console.log(`所有分析纯本地完成。用 --days 7 只看最近一周。`);
+  console.log("所有分析纯本地完成。用 --days 7 只看最近一周。");
 }
 
 async function siteRun(
   name: string,
   args: string[],
-  options: SiteOptions
+  options: SiteOptions,
 ): Promise<void> {
   const sites = getAllSites();
   const site = sites.find(s => s.name === name);
 
   if (!site) {
     const fuzzy = sites.filter(s => s.name.includes(name));
+    if (options.json) {
+      exitJsonError(`site "${name}" not found`, {
+        suggestions: fuzzy.slice(0, 5).map(s => s.name),
+        action: fuzzy.length > 0 ? undefined : "bb-browser site update",
+      });
+    }
     console.error(`[error] site: "${name}" not found.`);
     if (fuzzy.length > 0) {
       console.error("  Did you mean:");
@@ -485,7 +529,7 @@ async function siteRun(
       const flagName = args[i].slice(2);
       if (flagName in site.args && args[i + 1]) {
         argMap[flagName] = args[i + 1];
-        i++; // 跳过值
+        i++;
       }
     } else {
       positionalArgs.push(args[i]);
@@ -503,11 +547,17 @@ async function siteRun(
   // 只检查 required 参数
   for (const [argName, argDef] of Object.entries(site.args)) {
     if (argDef.required && !argMap[argName]) {
-      console.error(`[error] site ${name}: missing required argument "${argName}".`);
       const usage = argNames.map(a => {
         const def = site.args[a];
         return def.required ? `<${a}>` : `[${a}]`;
       }).join(" ");
+      if (options.json) {
+        exitJsonError(`missing required argument "${argName}"`, {
+          usage: `bb-browser site ${name} ${usage}`,
+          example: site.example,
+        });
+      }
+      console.error(`[error] site ${name}: missing required argument "${argName}".`);
       console.error(`  Usage: bb-browser site ${name} ${usage}`);
       if (site.example) console.error(`  Example: ${site.example}`);
       process.exit(1);
@@ -572,7 +622,7 @@ async function siteRun(
 
     if (options.jq) {
       const { applyJq } = await import("../jq.js");
-      const expr = options.jq.replace(/^\.data\./, '.');
+      const expr = options.jq.replace(/^\.data\./, ".");
       const results = applyJq(parsed, expr);
       for (const r of results) {
         console.log(typeof r === "string" ? r : JSON.stringify(r));
@@ -597,7 +647,7 @@ async function siteRun(
 
     if (listResp.success && listResp.data?.tabs) {
       const matchingTab = listResp.data.tabs.find((tab: TabInfo) =>
-        matchTabOrigin(tab.url, site.domain)
+        matchTabOrigin(tab.url, site.domain),
       );
       if (matchingTab) {
         targetTabId = matchingTab.tabId;
@@ -677,7 +727,7 @@ async function siteRun(
   if (options.jq) {
     const { applyJq } = await import("../jq.js");
     // Tolerate ".data." prefix — Agent may copy from --json envelope structure
-    const expr = options.jq.replace(/^\.data\./, '.');
+    const expr = options.jq.replace(/^\.data\./, ".");
     const results = applyJq(parsed, expr);
     for (const r of results) {
       console.log(typeof r === "string" ? r : JSON.stringify(r));
@@ -693,7 +743,7 @@ async function siteRun(
 
 export async function siteCommand(
   args: string[],
-  options: SiteOptions = {}
+  options: SiteOptions = {},
 ): Promise<void> {
   const subCommand = args[0];
 
@@ -727,7 +777,9 @@ export async function siteCommand(
   }
 
   switch (subCommand) {
-    case "list":   siteList(options); break;
+    case "list":
+      siteList(options);
+      break;
     case "search":
       if (!args[1]) {
         console.error("[error] site search: <query> is required.");
@@ -747,7 +799,9 @@ export async function siteCommand(
     case "recommend":
       await siteRecommend(options);
       break;
-    case "update":  siteUpdate(); break;
+    case "update":
+      siteUpdate(options);
+      break;
     case "run":
       if (!args[1]) {
         console.error("[error] site run: <name> is required.");
